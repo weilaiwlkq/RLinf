@@ -258,6 +258,42 @@ class EnvOutput:
 
 
 @dataclass(kw_only=True)
+class RTCRequest:
+    """A real-world RTC replanning request sent from env worker to rollout worker."""
+
+    obs: dict[str, Any]
+    request_type: str = "replan"  # bootstrap | replan | stop
+    executed_horizon: int = 0
+    predicted_delay_steps: int = 0
+    chunk_id: int = 0
+    episode_id: int = 0
+
+    def __post_init__(self):
+        if self.obs:
+            self.obs = put_tensor_device(self.obs, "cpu")
+
+
+@dataclass(kw_only=True)
+class RTCActionResponse:
+    """A real-world RTC response carrying a fresh action chunk and timing stats."""
+
+    actions: torch.Tensor
+    model_actions: torch.Tensor | None = None
+    infer_ms: float = 0.0
+    request_type: str = "replan"
+    predicted_delay_steps: int = 0
+    chunk_id: int = 0
+    episode_id: int = 0
+    guidance_applied: bool = False
+
+    def __post_init__(self):
+        if self.actions is not None:
+            self.actions = self.actions.cpu().contiguous()
+        if self.model_actions is not None:
+            self.model_actions = self.model_actions.cpu().contiguous()
+
+
+@dataclass(kw_only=True)
 class RolloutResult:
     """Rollout result for a single chunk step."""
 
@@ -721,7 +757,7 @@ class EmbodiedRolloutResult:
             elif isinstance(value, torch.Tensor):
                 chunks = torch.chunk(value, split_size, dim=1)
                 for i in range(split_size):
-                    setattr(splited_trajectories[i], field_name, chunks[i].contiguous())
+                    setattr(splited_trajectories[i], field_name, chunks[i])
             else:
                 raise ValueError(
                     f"Unsupported value type: {type(value)} for field_name: {field_name}"

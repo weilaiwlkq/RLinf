@@ -14,6 +14,9 @@
 
 import copy
 import gc
+import json
+import time
+from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
@@ -23,11 +26,13 @@ from tqdm import tqdm
 
 from rlinf.config import SupportedModel
 from rlinf.data.embodied_io_struct import (
+    RTCActionResponse,
+    RTCRequest,
     RolloutResult,
 )
-from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
+from rlinf.models.embodiment.openpi.rtc_guidance import RTCGuidanceContext
 from rlinf.scheduler import Channel, Cluster, CollectiveGroupOptions, Worker
 from rlinf.utils.comm_mapping import CommMapper
 from rlinf.utils.placement import HybridComponentPlacement
@@ -45,9 +50,6 @@ class MultiStepRolloutWorker(Worker):
 
         self.num_pipeline_stages = cfg.rollout.pipeline_stage_num
         self.enable_offload = self.cfg.rollout.get("enable_offload", False)
-        self.sync_weight_load_instant = self.cfg.rollout.get(
-            "sync_weight_load_instant", True
-        )
 
         self.placement = HybridComponentPlacement(cfg, Cluster())
 
@@ -80,19 +82,36 @@ class MultiStepRolloutWorker(Worker):
             cfg.env.train.max_steps_per_rollout_epoch
             // cfg.actor.model.num_action_chunks
         )
+        self.eval_action_chunks = int(
+            cfg.actor.model.get("action_chunk", cfg.actor.model.num_action_chunks)
+        )
+        if self.eval_action_chunks <= 0:
+            raise ValueError(
+                f"actor.model.action_chunk must be positive, got {self.eval_action_chunks}."
+            )
+        if (
+            cfg.env.eval.max_steps_per_rollout_epoch % self.eval_action_chunks
+            != 0
+        ):
+            raise ValueError(
+                "env.eval.max_steps_per_rollout_epoch must be divisible by "
+                f"actor.model.action_chunk ({self.eval_action_chunks})."
+            )
         self.n_eval_chunk_steps = (
             cfg.env.eval.max_steps_per_rollout_epoch
-            // cfg.actor.model.num_action_chunks
+            // self.eval_action_chunks
         )
         self.collect_prev_infos = self.cfg.rollout.get("collect_prev_infos", True)
         self.version = 0
         self.finished_episodes = None
-
-        weight_syncer_cfg = OmegaConf.select(cfg, "weight_syncer", default=None)
-        assert weight_syncer_cfg is not None, (
-            "rollout.weight_syncer config must be provided"
+        self._replay_cfg = self.cfg.rollout.get("replay_actions", None)
+        self._replay_enabled = bool(
+            self._replay_cfg and getattr(self._replay_cfg, "enabled", False)
         )
-        self.weight_syncer = WeightSyncer.create(weight_syncer_cfg)
+        self._replay_actions_cache: dict[int, np.ndarray] = {}
+        self._replay_action_cursor: dict[int, int] = {}
+        self._replay_exhausted_warned: set[int] = set()
+        self._rtc_eval_model_actions = None
 
     def init_worker(self):
         rollout_model_config = copy.deepcopy(self.cfg.actor.model)
@@ -134,19 +153,16 @@ class MultiStepRolloutWorker(Worker):
                 eval_batch_size=self.eval_batch_size,
             )
 
-        self.dst_ranks = {}
-        self.src_ranks = {}
-        if not self.cfg.runner.only_eval:
-            self.dst_ranks = {
-                "train": self._setup_dst_ranks(
-                    self.total_num_train_envs // self.num_pipeline_stages
-                ),
-            }
-            self.src_ranks = {
-                "train": self._setup_src_ranks(
-                    self.total_num_train_envs // self.num_pipeline_stages
-                ),
-            }
+        self.dst_ranks = {
+            "train": self._setup_dst_ranks(
+                self.total_num_train_envs // self.num_pipeline_stages
+            ),
+        }
+        self.src_ranks = {
+            "train": self._setup_src_ranks(
+                self.total_num_train_envs // self.num_pipeline_stages
+            ),
+        }
         if self.enable_eval:
             self.dst_ranks["eval"] = self._setup_dst_ranks(
                 self.total_num_eval_envs // self.num_pipeline_stages
@@ -263,11 +279,10 @@ class MultiStepRolloutWorker(Worker):
 
         if SupportedModel(self.cfg.actor.model.model_type) in [
             SupportedModel.OPENPI,
+            SupportedModel.OPENPI_CFG,
             SupportedModel.MLP_POLICY,
             SupportedModel.GR00T,
-            SupportedModel.DREAMZERO,
             SupportedModel.CNN_POLICY,
-            SupportedModel.CFG_MODEL,
         ]:
             if self.cfg.algorithm.loss_type == "embodied_dagger":
                 kwargs = {"mode": "eval"}
@@ -327,9 +342,65 @@ class MultiStepRolloutWorker(Worker):
 
         if isinstance(actions, np.ndarray):
             actions = torch.from_numpy(actions)
+        if isinstance(actions, torch.Tensor):
+            print("[rollout_predict] actions[..., -1]:", actions[..., -1].detach().cpu().numpy())
+        else:
+            print("[rollout_predict] actions[..., -1]:", np.asarray(actions)[..., -1])
 
         result["expert_label_flag"] = bool(expert_label_flag)
         return actions, result
+
+    @Worker.timer("predict_rtc")
+    def predict_rtc(self, rtc_request: RTCRequest) -> RTCActionResponse:
+        rtc_context = None
+        guidance_applied = False
+        if (
+            rtc_request.request_type == "replan"
+            and self._rtc_eval_model_actions is not None
+        ):
+            rtc_context = RTCGuidanceContext(
+                prev_model_actions=self._rtc_eval_model_actions,
+                executed_horizon=rtc_request.executed_horizon,
+                delay_steps=rtc_request.predicted_delay_steps,
+            )
+            guidance_applied = True
+
+        infer_t0 = time.perf_counter()
+        with torch.no_grad():
+            actions, result = self.hf_model.predict_action_batch(
+                env_obs=rtc_request.obs,
+                mode="eval",
+                rtc_context=rtc_context,
+            )
+        infer_ms = (time.perf_counter() - infer_t0) * 1000.0
+
+        if isinstance(actions, np.ndarray):
+            actions = torch.from_numpy(actions)
+
+        if isinstance(actions, torch.Tensor):
+            print(
+                "[rollout_predict_rtc] actions[..., -1]:",
+                actions[..., -1].detach().cpu().numpy(),
+            )
+        else:
+            print("[rollout_predict_rtc] actions[..., -1]:", np.asarray(actions)[..., -1])
+
+        model_actions = result.get("model_actions")
+        if isinstance(model_actions, np.ndarray):
+            model_actions = torch.from_numpy(model_actions)
+        if model_actions is not None:
+            self._rtc_eval_model_actions = model_actions.detach().cpu().contiguous()
+
+        return RTCActionResponse(
+            actions=actions.detach().cpu().contiguous(),
+            model_actions=self._rtc_eval_model_actions,
+            infer_ms=infer_ms,
+            request_type=rtc_request.request_type,
+            predicted_delay_steps=rtc_request.predicted_delay_steps,
+            chunk_id=rtc_request.chunk_id,
+            episode_id=rtc_request.episode_id,
+            guidance_applied=guidance_applied,
+        )
 
     def get_bootstrap_values(
         self, final_obs: dict[str, Any] | None
@@ -350,41 +421,15 @@ class MultiStepRolloutWorker(Worker):
 
     async def sync_model_from_actor(self):
         """Sync model parameters from the actor worker."""
+        param_state_dict = await self.recv(
+            self.actor_group_name,
+            src_rank=self.actor_weight_src_rank,
+            async_op=True,
+            options=self._sync_weight_comm_options,
+        ).async_wait()
+        self.hf_model.load_state_dict(param_state_dict)
 
-        async def recv_func() -> Any:
-            data = await self.recv(
-                src_group_name=self.actor_group_name,
-                src_rank=self.actor_weight_src_rank,
-                async_op=True,
-                options=self._sync_weight_comm_options,
-            ).async_wait()
-            return data
-
-        async def send_func(data: Any) -> None:
-            await self.send(
-                data,
-                dst_group_name=self.actor_group_name,
-                dst_rank=self.actor_weight_src_rank,
-                async_op=True,
-                options=self._sync_weight_comm_options,
-            ).async_wait()
-
-        if not self.weight_syncer.receiver_initialized():
-            await self.weight_syncer.init_receiver(
-                state_dict=self.hf_model.state_dict(),
-                recv=recv_func,
-                send=send_func,
-            )
-
-        applied_version = await self.weight_syncer.apply(self.hf_model, recv_func)
-        self.version = applied_version
-        if self.finished_episodes is None:
-            self.finished_episodes = (
-                self.version * self.total_num_train_envs * self.rollout_epoch
-            )
-        if hasattr(self.hf_model, "set_global_step"):
-            self.hf_model.set_global_step(applied_version)
-
+        del param_state_dict
         gc.collect()
         self.torch_platform.empty_cache()
 
@@ -458,19 +503,75 @@ class MultiStepRolloutWorker(Worker):
     async def evaluate(self, input_channel: Channel, output_channel: Channel):
         if self.enable_offload:
             self.reload_model()
+        if self._replay_enabled:
+            self._init_replay_actions()
+        stop_eval = False
         for _ in tqdm(
             range(self.cfg.algorithm.eval_rollout_epoch),
             desc="Evaluating Rollout Epochs",
             disable=(self._rank != 0),
         ):
             for _ in range(self.n_eval_chunk_steps):
-                for _ in range(self.num_pipeline_stages):
+                for stage_id in range(self.num_pipeline_stages):
                     env_output = await self.recv_env_output(input_channel, mode="eval")
-                    actions, _ = self.predict(env_output["obs"], mode="eval")
+                    if env_output.get("eval_stop", False):
+                        stop_eval = True
+                        break
+                    if self._replay_enabled:
+                        actions = self._get_replay_chunk_actions(stage_id)
+                    else:
+                        actions, _ = self.predict(env_output["obs"], mode="eval")
                     self.send_chunk_actions(output_channel, actions, mode="eval")
+                if stop_eval:
+                    break
+            if stop_eval:
+                break
 
         if self.enable_offload:
             self.offload_model()
+
+    async def evaluate_rtc(self, input_channel: Channel, output_channel: Channel):
+        if self._replay_enabled:
+            raise RuntimeError("RTC evaluation does not support rollout.replay_actions.")
+
+        if self.enable_offload:
+            self.reload_model()
+
+        self._rtc_eval_model_actions = None
+        infer_ms = []
+        guided_infer_ms = []
+        bootstrap_infer_ms = []
+        eval_t0 = time.perf_counter()
+
+        while True:
+            rtc_request = await self.recv_rtc_request(input_channel)
+            if rtc_request.request_type == "stop":
+                break
+
+            rtc_response = self.predict_rtc(rtc_request)
+            infer_ms.append(rtc_response.infer_ms)
+            if rtc_response.guidance_applied:
+                guided_infer_ms.append(rtc_response.infer_ms)
+            else:
+                bootstrap_infer_ms.append(rtc_response.infer_ms)
+
+            self.send_rtc_response(output_channel, rtc_response)
+
+        if self.enable_offload:
+            self.offload_model()
+
+        return {
+            "rtc_infer_ms_per_call": torch.as_tensor(infer_ms, dtype=torch.float32),
+            "rtc_guided_infer_ms_per_call": torch.as_tensor(
+                guided_infer_ms, dtype=torch.float32
+            ),
+            "rtc_bootstrap_infer_ms": torch.as_tensor(
+                bootstrap_infer_ms, dtype=torch.float32
+            ),
+            "rtc_rollout_wall_time_s": torch.as_tensor(
+                [time.perf_counter() - eval_t0], dtype=torch.float32
+            ),
+        }
 
     def offload_model(self):
         if self.enable_cuda_graph:
@@ -584,7 +685,41 @@ class MultiStepRolloutWorker(Worker):
             ]
             merged_final_obs = _merge_obs_dicts(final_obs_or_obs)
 
-        return {"obs": merged_obs, "final_obs": merged_final_obs}
+        eval_stop = any(
+            bool(obs_batch.get("eval_stop", False)) for obs_batch in obs_batches
+        )
+
+        return {
+            "obs": merged_obs,
+            "final_obs": merged_final_obs,
+            "eval_stop": eval_stop,
+        }
+
+    async def recv_rtc_request(self, input_channel: Channel) -> RTCRequest:
+        src_ranks_and_sizes = self.src_ranks["eval"]
+        assert len(src_ranks_and_sizes) == 1, (
+            "RTC real-world evaluation currently supports a single env->rollout route."
+        )
+        src_rank, _ = src_ranks_and_sizes[0]
+        rtc_request = await input_channel.get(
+            key=CommMapper.build_channel_key(src_rank, self._rank, extra="eval_rtc"),
+            async_op=True,
+        ).async_wait()
+        return rtc_request
+
+    def send_rtc_response(
+        self, output_channel: Channel, rtc_response: RTCActionResponse
+    ) -> None:
+        dst_ranks_and_sizes = self.dst_ranks["eval"]
+        assert len(dst_ranks_and_sizes) == 1, (
+            "RTC real-world evaluation currently supports a single rollout->env route."
+        )
+        dst_rank, _ = dst_ranks_and_sizes[0]
+        output_channel.put(
+            rtc_response,
+            key=CommMapper.build_channel_key(self._rank, dst_rank, extra="eval_rtc"),
+            async_op=True,
+        )
 
     def send_chunk_actions(
         self,
@@ -681,5 +816,118 @@ class MultiStepRolloutWorker(Worker):
             )
 
     def set_global_step(self, global_step: int):
+        self.version = global_step
+        if self.finished_episodes is None:
+            self.finished_episodes = (
+                self.version * self.total_num_train_envs * self.rollout_epoch
+            )
         if hasattr(self.hf_model, "set_global_step"):
             self.hf_model.set_global_step(global_step)
+
+    def _init_replay_actions(self) -> None:
+        if self.eval_batch_size != 1:
+            raise ValueError(
+                "Replay mode currently only supports rollout eval_batch_size == 1."
+            )
+        if self._replay_actions_cache:
+            return
+
+        dataset_root = Path(self._replay_cfg.dataset_root).expanduser().resolve()
+        if not dataset_root.exists():
+            raise FileNotFoundError(
+                f"Replay dataset root does not exist: {dataset_root}"
+            )
+
+        info_path = dataset_root / "meta" / "info.json"
+        with open(info_path, encoding="utf-8") as f:
+            info = json.load(f)
+        data_path_tpl = info.get("data_path", "")
+        if not data_path_tpl:
+            raise ValueError(f"Missing 'data_path' in {info_path}")
+
+        action_key = getattr(self._replay_cfg, "action_key", "actions")
+        episode_start = int(getattr(self._replay_cfg, "episode_index", 0))
+        episode_stride = int(getattr(self._replay_cfg, "episode_stride", 1))
+
+        for stage_id in range(self.num_pipeline_stages):
+            episode_index = episode_start + stage_id * episode_stride
+            episode_chunk = episode_index // int(info.get("chunks_size", 1000))
+            relative_parquet = data_path_tpl.format(
+                episode_chunk=episode_chunk, episode_index=episode_index
+            )
+            parquet_path = dataset_root / relative_parquet
+            actions = self._load_replay_actions(parquet_path, action_key)
+            if actions.ndim != 2:
+                raise ValueError(
+                    f"Expected replay actions to be 2D [T, action_dim], got {actions.shape} from {parquet_path}"
+                )
+            self._replay_actions_cache[stage_id] = actions
+            self._replay_action_cursor[stage_id] = 0
+            self.log_info(
+                f"Loaded replay actions for stage {stage_id}: episode={episode_index}, "
+                f"shape={actions.shape}, parquet={parquet_path}"
+            )
+
+    @staticmethod
+    def _load_replay_actions(parquet_path: Path, action_key: str) -> np.ndarray:
+        try:
+            import pyarrow.parquet as pq
+        except Exception as e:  # pragma: no cover
+            raise ImportError(
+                "Replay mode requires pyarrow. Please install pyarrow in your runtime environment."
+            ) from e
+
+        if not parquet_path.exists():
+            raise FileNotFoundError(f"Replay parquet file does not exist: {parquet_path}")
+        table = pq.read_table(str(parquet_path))
+        if table.num_rows == 0:
+            raise ValueError(f"Replay parquet is empty: {parquet_path}")
+        col_name = action_key
+        if col_name not in table.column_names:
+            fallback_names = ["actions", "action"]
+            col_name = next((name for name in fallback_names if name in table.column_names), None)
+            if col_name is None:
+                raise ValueError(
+                    f"Action column not found in {parquet_path}. "
+                    f"Requested '{action_key}', available columns: {table.column_names}"
+                )
+
+        actions_col = table.column(col_name)
+        actions_list = actions_col.to_pylist()
+        if not actions_list:
+            raise ValueError(f"Action column '{col_name}' is empty in {parquet_path}")
+        try:
+            actions = np.stack([np.asarray(action, dtype=np.float32) for action in actions_list], axis=0)
+        except Exception as e:
+            raise ValueError(
+                f"Failed to parse action column '{col_name}' in {parquet_path}. "
+                f"Example value type: {type(actions_list[0])}, value: {actions_list[0]}"
+            ) from e
+        return actions
+
+    def _get_replay_chunk_actions(self, stage_id: int) -> torch.Tensor:
+        actions = self._replay_actions_cache[stage_id]
+        cursor = self._replay_action_cursor[stage_id]
+        chunk_size = int(self.cfg.actor.model.num_action_chunks)
+        end = cursor + chunk_size
+        replay_len = actions.shape[0]
+
+        if cursor >= replay_len:
+            if stage_id not in self._replay_exhausted_warned:
+                self.log_warning(
+                    f"Replay actions exhausted for stage {stage_id}: cursor={cursor}, len={replay_len}. "
+                    "Falling back to repeating the final action."
+                )
+                self._replay_exhausted_warned.add(stage_id)
+            last_action = actions[-1][None, :]
+            chunk = np.repeat(last_action, chunk_size, axis=0)
+        else:
+            chunk = actions[cursor:min(end, replay_len)]
+            if chunk.shape[0] < chunk_size:
+                pad_num = chunk_size - chunk.shape[0]
+                pad = np.repeat(chunk[-1][None, :], pad_num, axis=0)
+                chunk = np.concatenate([chunk, pad], axis=0)
+
+            self._replay_action_cursor[stage_id] = end
+
+        return torch.from_numpy(chunk[None, ...])

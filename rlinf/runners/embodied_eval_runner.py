@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import os
+import time
 import typing
 
 from rlinf.scheduler import Channel
@@ -52,32 +55,89 @@ class EmbodiedEvalRunner:
 
         self.logger = get_logger()
 
-    def init_workers(self):
-        rollout_handle = self.rollout.init_worker()
-        env_handle = self.env.init_worker()
+    @staticmethod
+    def _jsonable_metric(value):
+        if hasattr(value, "tolist"):
+            value = value.tolist()
+        if isinstance(value, list) and len(value) == 1:
+            return value[0]
+        return value
 
-        rollout_handle.wait()
-        env_handle.wait()
+    def _write_eval_summary(self, eval_metrics: dict):
+        if not self.cfg.runner.get("write_eval_summary", True):
+            return
+
+        log_path = self.cfg.runner.logger.get("log_path", None)
+        if not log_path:
+            return
+
+        os.makedirs(log_path, exist_ok=True)
+        summary_path = os.path.join(log_path, "eval_summary.json")
+        summary = {
+            key: self._jsonable_metric(value) for key, value in eval_metrics.items()
+        }
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+        self.logger.info(f"Wrote eval summary to {summary_path}")
+
+    def init_workers(self):
+        self.rollout.init_worker().wait()
+        self.env.init_worker().wait()
 
     def evaluate(self):
+        eval_t0 = time.perf_counter()
         env_handle: Handle = self.env.evaluate(
-            input_channel=self.env_channel,
-            rollout_channel=self.rollout_channel,
-        )
-        rollout_handle: Handle = self.rollout.evaluate(
             input_channel=self.rollout_channel,
             output_channel=self.env_channel,
+        )
+        rollout_handle: Handle = self.rollout.evaluate(
+            input_channel=self.env_channel,
+            output_channel=self.rollout_channel,
         )
         env_results = env_handle.wait()
         rollout_handle.wait()
         eval_metrics_list = [results for results in env_results if results is not None]
         eval_metrics = compute_evaluate_metrics(eval_metrics_list)
+        eval_metrics["eval_wall_time_s"] = time.perf_counter() - eval_t0
+        eval_metrics["eval_mode_is_rtc"] = 0.0
         return eval_metrics
 
+    def evaluate_rtc(self):
+        eval_t0 = time.perf_counter()
+        env_handle: Handle = self.env.evaluate_rtc(
+            input_channel=self.rollout_channel,
+            output_channel=self.env_channel,
+        )
+        rollout_handle: Handle = self.rollout.evaluate_rtc(
+            input_channel=self.env_channel,
+            output_channel=self.rollout_channel,
+        )
+
+        env_results = env_handle.wait()
+        rollout_results = rollout_handle.wait()
+
+        env_metrics_list = [results for results in env_results if results is not None]
+        rollout_metrics_list = [
+            results for results in rollout_results if results is not None
+        ]
+
+        env_metrics = compute_evaluate_metrics(env_metrics_list)
+        rollout_metrics = compute_evaluate_metrics(rollout_metrics_list)
+        rollout_metrics.pop("num_trajectories", None)
+        env_metrics.update(rollout_metrics)
+        env_metrics["eval_wall_time_s"] = time.perf_counter() - eval_t0
+        env_metrics["eval_mode_is_rtc"] = 1.0
+        return env_metrics
+
     def run(self):
-        eval_metrics = self.evaluate()
+        rtc_cfg = self.cfg.runner.get("rtc", {})
+        if rtc_cfg.get("enabled", False):
+            eval_metrics = self.evaluate_rtc()
+        else:
+            eval_metrics = self.evaluate()
         eval_metrics = {f"eval/{k}": v for k, v in eval_metrics.items()}
         self.logger.info(eval_metrics)
+        self._write_eval_summary(eval_metrics)
         self.metric_logger.log(step=0, data=eval_metrics)
 
         self.metric_logger.finish()

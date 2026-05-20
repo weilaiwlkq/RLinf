@@ -29,6 +29,10 @@ from openpi.models_pytorch.pi0_pytorch import PI0Pytorch, make_att_2d_masks
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
 from rlinf.models.embodiment.modules.explore_noise_net import ExploreNoiseNet
 from rlinf.models.embodiment.modules.value_head import ValueHead
+from rlinf.models.embodiment.openpi.rtc_guidance import (
+    RTCGuidanceContext,
+    sample_actions_with_rtc_guidance as _sample_actions_with_rtc_guidance,
+)
 from rlinf.utils.logging import get_logger
 from rlinf.utils.nested_dict_process import copy_dict_tensor
 
@@ -53,6 +57,10 @@ class OpenPi0Config(Pi0Config):
     action_chunk: int = 5  # action chunk
     action_env_dim: int = 7  # for environment action dim
     num_steps: int = 10  # denoise steps
+    # rtc config
+    rtc_enabled: bool = False
+    rtc_guidance_mode: str = "approx"
+    rtc_guidance_clip: float = 5.0
     # training config
     train_expert_only: bool = False
     safe_get_logprob: bool = False
@@ -354,6 +362,26 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             obs_dict["actions"] = batch["action"].reshape(
                 bsz, self.config.action_chunk, -1
             )
+            if obs_dict["actions"].shape[2] < self.config.action_dim:
+                padding_action_dim = torch.zeros(
+                    bsz,
+                    obs_dict["actions"].shape[1],
+                    self.config.action_dim - obs_dict["actions"].shape[2],
+                    device=obs_dict["actions"].device,
+                )
+                obs_dict["actions"] = torch.cat(
+                    [obs_dict["actions"], padding_action_dim], dim=2
+                )
+            if obs_dict["actions"].shape[1] < self.config.action_horizon:
+                padding_action_chunk = torch.zeros(
+                    bsz,
+                    self.config.action_horizon - obs_dict["actions"].shape[1],
+                    self.config.action_dim,
+                    device=obs_dict["actions"].device,
+                )
+                obs_dict["actions"] = torch.cat(
+                    [obs_dict["actions"], padding_action_chunk], dim=1
+                )
             obs_dict["prompt"] = ["empty" for _ in range(bsz)]
             processed_obs = self.input_transform(obs_dict, transpose=False)
             if "tokenized_prompt" in batch:
@@ -520,6 +548,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         env_obs,
         mode: Literal["train", "eval"] = "train",
         compute_values=True,
+        rtc_context: RTCGuidanceContext | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         to_process_obs = self.obs_processor(env_obs)  # env obs -> policy input obs
@@ -563,9 +592,21 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
         else:
             # Non-DSRL or eval mode
-            outputs = self.sample_actions(
-                observation, mode=mode, compute_values=compute_values
-            )
+            if (
+                rtc_context is not None
+                and mode == "eval"
+                and self.config.rtc_enabled
+            ):
+                outputs = self.sample_actions_with_rtc_guidance(
+                    observation,
+                    rtc_context=rtc_context,
+                    mode=mode,
+                    compute_values=compute_values,
+                )
+            else:
+                outputs = self.sample_actions(
+                    observation, mode=mode, compute_values=compute_values
+                )
             actions = self.output_transform(
                 {"actions": outputs["actions"], "state": observation.state}
             )["actions"]
@@ -606,8 +647,31 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             "prev_logprobs": prev_logprobs,
             "prev_values": prev_values,
             "forward_inputs": forward_inputs,
+            "model_actions": outputs["actions"],
         }
         return actions, result
+
+    @torch.no_grad()
+    def sample_actions_with_rtc_guidance(
+        self,
+        observation: _model.Observation,
+        rtc_context: RTCGuidanceContext,
+        noise=None,
+        mode="eval",
+        compute_values=True,
+    ) -> dict[str, torch.Tensor]:
+        if self.config.rtc_guidance_mode != "approx":
+            raise NotImplementedError(
+                f"Unsupported RTC guidance mode: {self.config.rtc_guidance_mode}"
+            )
+        return _sample_actions_with_rtc_guidance(
+            self,
+            observation,
+            rtc_context=rtc_context,
+            noise=noise,
+            mode=mode,
+            compute_values=compute_values,
+        )
 
     @torch.no_grad()
     def sample_actions(
